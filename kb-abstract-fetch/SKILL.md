@@ -1,12 +1,12 @@
 ---
 name: kb-abstract-fetch
-description: Fetch and backfill missing `abstract` values from PostgreSQL `journals` by opening DOI redirect pages (`https://doi.org/{doi}`) with OpenClaw Browser and extracting page abstracts. Use when `kb-meta-fetch` has inserted metadata rows with empty abstract and you need latest-created rows processed in controlled batches (default 100) with dry-run and safe-write guards.
+description: Fetch and backfill missing `abstract` values from PostgreSQL `journals` by opening DOI redirect pages (`https://doi.org/{doi}`) with OpenClaw Browser and extracting page abstracts. Use when `fetch-meta-crossref2kb` has inserted metadata rows with empty abstract and you need latest-created rows processed in controlled batches (default 100) with dry-run and safe-write guards.
 ---
 
 # KB Abstract Fetch
 
 ## Core Goal
-- Reuse the same PostgreSQL connection env variables as `kb-meta-fetch`.
+- Reuse the same PostgreSQL connection env variables as `fetch-meta-crossref2kb`.
 - Select rows whose `abstract` is empty and order by newest `created_at` first.
 - Open `https://doi.org/<doi>` in OpenClaw Browser and extract abstract text.
 - Write back only when the row is still empty at update time.

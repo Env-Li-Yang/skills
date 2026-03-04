@@ -1,9 +1,9 @@
 ---
-name: kb-meta-fetch
+name: fetch-meta-crossref2kb
 description: Fetch journal articles from Crossref published after a user-specified date and insert them into PostgreSQL `journals` with DOI deduplication. Use when incrementally ingesting journal metadata from `journals_issn` into `journals`.
 ---
 
-# KB Meta Fetch
+# Fetch Meta Crossref2KB
 
 ## Core Goal
 - Pull `journal-article` records from Crossref after a given `--from-date`.
