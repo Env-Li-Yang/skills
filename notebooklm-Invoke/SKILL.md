@@ -31,6 +31,7 @@ python3 {baseDir}/scripts/notebooklm.py ask "Summarize the key takeaways" --note
 
 ## References
 - `README.md` (installation, requirements, troubleshooting)
+- `QUICKSTART_CN.md`（中文快速上手）
 - `references/cli-commands.md`
 
 ## Assets
