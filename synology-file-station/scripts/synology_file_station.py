@@ -143,6 +143,8 @@ class SynologyConfig:
     verify_ssl: bool = True
     timeout: int = 30
     session: str = "FileStation"
+    readonly: bool = False
+    mutation_allow_paths: tuple[str, ...] = ()
 
 
 def emit_json(payload: Mapping[str, Any], stream: Any = sys.stdout) -> None:
@@ -207,6 +209,74 @@ def normalize_base_url(raw: str) -> str:
     return text.rstrip("/")
 
 
+def normalize_remote_path(raw: str, label: str = "path") -> str:
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError(f"{label} is required")
+    if not text.startswith("/"):
+        raise ValueError(f"{label} must start with '/': {raw!r}")
+    normalized = "/" + "/".join(token for token in text.split("/") if token)
+    return normalized if normalized else "/"
+
+
+def parse_allow_paths(raw: str | None) -> tuple[str, ...]:
+    items = split_csv_items([raw]) if raw else []
+    if not items:
+        return ()
+
+    normalized: list[str] = []
+    for item in items:
+        path = normalize_remote_path(item, "SYNOLOGY_MUTATION_ALLOW_PATHS")
+        if path not in normalized:
+            normalized.append(path)
+    return tuple(normalized)
+
+
+def path_in_allowlist(path: str, allow_paths: Sequence[str]) -> bool:
+    normalized = normalize_remote_path(path)
+    for allowed in allow_paths:
+        if normalized == allowed:
+            return True
+        if normalized.startswith(allowed.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def ensure_write_enabled(config: SynologyConfig, command: str) -> None:
+    if config.readonly:
+        raise SynologyError(
+            f"Command {command!r} is blocked: SYNOLOGY_READONLY=true (read-only mode)"
+        )
+
+
+def ensure_mutation_allowed(
+    config: SynologyConfig,
+    command: str,
+    target_paths: Sequence[str],
+) -> None:
+    ensure_write_enabled(config, command)
+
+    if not config.mutation_allow_paths:
+        # Backward-compatible behavior: no allowlist means unrestricted mutation paths.
+        return
+
+    blocked: list[str] = []
+    for path in target_paths:
+        try:
+            normalized = normalize_remote_path(path)
+        except ValueError as exc:
+            raise SynologyError(str(exc)) from exc
+        if not path_in_allowlist(normalized, config.mutation_allow_paths):
+            blocked.append(normalized)
+
+    if blocked:
+        raise SynologyError(
+            "Command "
+            f"{command!r} is blocked: target path(s) outside SYNOLOGY_MUTATION_ALLOW_PATHS: "
+            + ", ".join(blocked)
+        )
+
+
 def normalize_api_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
@@ -250,11 +320,15 @@ def load_config_from_env(env: Mapping[str, str] | None = None) -> SynologyConfig
     verify_ssl_raw = source.get("SYNOLOGY_VERIFY_SSL", "true")
     timeout_raw = source.get("SYNOLOGY_TIMEOUT", "30")
     session_name = (source.get("SYNOLOGY_SESSION") or "FileStation").strip() or "FileStation"
+    readonly_raw = source.get("SYNOLOGY_READONLY", "false")
+    allow_paths_raw = source.get("SYNOLOGY_MUTATION_ALLOW_PATHS", "")
 
     try:
         verify_ssl = parse_bool_value(verify_ssl_raw, "SYNOLOGY_VERIFY_SSL")
         timeout = parse_int_value(timeout_raw, "SYNOLOGY_TIMEOUT", minimum=1)
         base_url = normalize_base_url(raw_url)
+        readonly = parse_bool_value(readonly_raw, "SYNOLOGY_READONLY")
+        mutation_allow_paths = parse_allow_paths(allow_paths_raw)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
 
@@ -265,6 +339,8 @@ def load_config_from_env(env: Mapping[str, str] | None = None) -> SynologyConfig
         verify_ssl=verify_ssl,
         timeout=timeout,
         session=session_name,
+        readonly=readonly,
+        mutation_allow_paths=mutation_allow_paths,
     )
 
 
@@ -781,6 +857,8 @@ def command_check_config(args: argparse.Namespace, config: SynologyConfig) -> Ma
         "session": config.session,
         "verify_ssl": config.verify_ssl,
         "timeout": config.timeout,
+        "readonly": config.readonly,
+        "mutation_allow_paths": list(config.mutation_allow_paths),
     }
 
     if not args.probe:
@@ -930,6 +1008,7 @@ def command_mkdir(args: argparse.Namespace, client: SynologyClient) -> Mapping[s
     parents = split_csv_items(args.parent)
     names = split_csv_items(args.name)
     parents, names = pair_values(parents, names, "--parent", "--name")
+    ensure_mutation_allowed(client.config, "mkdir", parents)
 
     params: dict[str, Any] = {
         "folder_path": encode_array(parents),
@@ -950,6 +1029,7 @@ def command_rename(args: argparse.Namespace, client: SynologyClient) -> Mapping[
     paths = split_csv_items(args.path)
     names = split_csv_items(args.name)
     paths, names = pair_values(paths, names, "--path", "--name")
+    ensure_mutation_allowed(client.config, "rename", paths)
 
     params: dict[str, Any] = {
         "path": encode_array(paths),
@@ -968,6 +1048,7 @@ def command_rename(args: argparse.Namespace, client: SynologyClient) -> Mapping[
 
 def command_copy_or_move(args: argparse.Namespace, client: SynologyClient, remove_src: bool) -> Mapping[str, Any]:
     paths = ensure_paths(args.path, "--path")
+    ensure_mutation_allowed(client.config, "move" if remove_src else "copy", [*paths, args.dest])
     params: dict[str, Any] = {
         "path": encode_array(paths),
         "dest_folder_path": args.dest,
@@ -1011,6 +1092,7 @@ def command_move(args: argparse.Namespace, client: SynologyClient) -> Mapping[st
 
 def command_delete(args: argparse.Namespace, client: SynologyClient) -> Mapping[str, Any]:
     paths = ensure_paths(args.path, "--path")
+    ensure_mutation_allowed(client.config, "delete", paths)
 
     if args.blocking:
         params = {
@@ -1061,6 +1143,7 @@ def command_delete(args: argparse.Namespace, client: SynologyClient) -> Mapping[
 
 def command_upload(args: argparse.Namespace, client: SynologyClient) -> Mapping[str, Any]:
     local_files = ensure_paths(args.file, "--file")
+    ensure_mutation_allowed(client.config, "upload", [args.dest_folder])
     uploaded: list[dict[str, Any]] = []
 
     for item in local_files:
@@ -1161,7 +1244,8 @@ def command_download(args: argparse.Namespace, client: SynologyClient) -> Mappin
 
 def command_compress(args: argparse.Namespace, client: SynologyClient) -> Mapping[str, Any]:
     # Keep argument validation so callers get immediate feedback on required params.
-    ensure_paths(args.path, "--path")
+    paths = ensure_paths(args.path, "--path")
+    ensure_mutation_allowed(client.config, "compress", [*paths, args.dest_file])
     if not args.dest_file:
         raise SynologyError("--dest-file is required")
 
@@ -1175,6 +1259,7 @@ def command_compress(args: argparse.Namespace, client: SynologyClient) -> Mappin
 
 
 def command_extract(args: argparse.Namespace, client: SynologyClient) -> Mapping[str, Any]:
+    ensure_mutation_allowed(client.config, "extract", [args.dest_folder])
     params: dict[str, Any] = {
         "file_path": args.archive,
         "dest_folder_path": args.dest_folder,
@@ -1238,6 +1323,7 @@ def command_task_status(args: argparse.Namespace, client: SynologyClient) -> Map
 
 
 def command_task_stop(args: argparse.Namespace, client: SynologyClient) -> Mapping[str, Any]:
+    ensure_write_enabled(client.config, "task-stop")
     api_key = TASK_APIS[args.api]
     client.call_with_task_id(api_key, "stop", args.task_id)
     return {
