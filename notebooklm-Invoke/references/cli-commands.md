@@ -60,6 +60,8 @@ python3 {baseDir}/scripts/notebooklm.py source wait <source_id> --notebook <note
 
 ## Artifacts
 
+> Slide deck best practice: target <=15 slides per generation. If more are needed, split into multiple decks and generate separately.
+
 ```bash
 python3 {baseDir}/scripts/notebooklm.py generate slide-deck "Create a 10-slide executive summary" --notebook <notebook_id>
 python3 {baseDir}/scripts/notebooklm.py artifact list --notebook <notebook_id> --json
@@ -68,7 +70,7 @@ python3 {baseDir}/scripts/notebooklm.py artifact rename <artifact_id> "New Title
 python3 {baseDir}/scripts/notebooklm.py artifact delete <artifact_id> --notebook <notebook_id>
 python3 {baseDir}/scripts/notebooklm.py artifact export <artifact_id> --notebook <notebook_id>
 python3 {baseDir}/scripts/notebooklm.py artifact suggestions --notebook <notebook_id> --json
-python3 {baseDir}/scripts/notebooklm.py download slide-deck ./slides.pdf --notebook <notebook_id> --latest
+python3 {baseDir}/scripts/notebooklm.py download slide-deck ./slides.pptx --notebook <notebook_id> --latest --format pptx
 python3 {baseDir}/scripts/notebooklm.py artifact wait <artifact_id> --notebook <notebook_id> --timeout 600 --json
 ```
 

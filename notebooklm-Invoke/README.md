@@ -80,6 +80,8 @@ python3 {baseDir}/scripts/notebooklm.py list --json
 
 ## 4) Quick start (MVP)
 
+> PPT policy: one deck should target **<=15 pages**. If more pages are needed, split into multiple decks and generate in batches.
+
 ```bash
 # Check auth
 python3 {baseDir}/scripts/notebooklm.py auth check
@@ -99,7 +101,12 @@ python3 {baseDir}/scripts/notebooklm.py generate slide-deck "Create 10 slides fo
 # Wait for artifact and download
 python3 {baseDir}/scripts/notebooklm.py artifact list --notebook <notebook_id> --json
 python3 {baseDir}/scripts/notebooklm.py artifact wait <artifact_id> --notebook <notebook_id> --timeout 600 --json
-python3 {baseDir}/scripts/notebooklm.py download slide-deck ./slides.pdf --notebook <notebook_id> --latest
+
+# Preferred download format: PPTX
+python3 {baseDir}/scripts/notebooklm.py download slide-deck ./slides.pptx --notebook <notebook_id> --latest --format pptx
+
+# Optional: PDF
+python3 {baseDir}/scripts/notebooklm.py download slide-deck ./slides.pdf --notebook <notebook_id> --latest --format pdf
 ```
 
 ---

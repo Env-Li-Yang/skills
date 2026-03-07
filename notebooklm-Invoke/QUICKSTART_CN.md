@@ -88,6 +88,8 @@ python3 {baseDir}/scripts/notebooklm.py source add "这里是文本内容" --tit
 
 ## 5. 生成 PPT（Slide Deck）
 
+> 规则：单次生成默认不超过 **15 页**。超过 15 页时请拆成多个 deck（如 Part 1/2/3）分别生成。
+
 ```bash
 # 1) 生成
 python3 {baseDir}/scripts/notebooklm.py generate slide-deck "做一份 10 页执行汇报" --notebook <notebook_id>
@@ -96,8 +98,11 @@ python3 {baseDir}/scripts/notebooklm.py generate slide-deck "做一份 10 页执
 python3 {baseDir}/scripts/notebooklm.py artifact list --notebook <notebook_id> --json
 python3 {baseDir}/scripts/notebooklm.py artifact wait <artifact_id> --notebook <notebook_id> --timeout 600 --json
 
-# 3) 下载
-python3 {baseDir}/scripts/notebooklm.py download slide-deck ./slides.pdf --notebook <notebook_id> --latest
+# 3) 下载（优先 .pptx）
+python3 {baseDir}/scripts/notebooklm.py download slide-deck ./slides.pptx --notebook <notebook_id> --latest --format pptx
+
+# 可选：下载 PDF
+python3 {baseDir}/scripts/notebooklm.py download slide-deck ./slides.pdf --notebook <notebook_id> --latest --format pdf
 ```
 
 ---

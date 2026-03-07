@@ -29,6 +29,12 @@ python3 {baseDir}/scripts/notebooklm.py ask "Summarize the key takeaways" --note
   - `artifact wait`
   - `research wait`
 
+## PPT generation policy
+- A single generated slide deck should target **at most 15 pages**.
+- If user requirements exceed 15 pages, split into multiple decks (e.g., Part 1/2/3) and generate separately.
+- After generation, provide downloadable **`.pptx`** output when possible:
+  - `download slide-deck ... --format pptx`
+
 ## References
 - `README.md` (installation, requirements, troubleshooting)
 - `QUICKSTART_CN.md`（中文快速上手）
