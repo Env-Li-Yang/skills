@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -93,6 +94,17 @@ def atomic_write_text_file(path: Path, content: str) -> None:
         raise
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def maybe_text(value: Any) -> str:
     if value is None:
         return ""
@@ -160,6 +172,10 @@ def fetch_plan_path(run_dir: Path, round_id: str) -> Path:
 
 def fetch_execution_path(run_dir: Path, round_id: str) -> Path:
     return round_dir(run_dir, round_id) / "moderator" / "derived" / "fetch_execution.json"
+
+
+def fetch_lock_path(run_dir: Path, round_id: str) -> Path:
+    return round_dir(run_dir, round_id) / "moderator" / "derived" / "fetch.lock"
 
 
 def source_selection_path(run_dir: Path, round_id: str, role: str) -> Path:
@@ -717,6 +733,15 @@ def build_current_step_text(run_dir: Path, state: dict[str, Any]) -> str:
                 "python3 "
                 + str(SCRIPT_DIR / "eco_council_supervisor.py")
                 + " continue-run --run-dir "
+                + str(run_dir)
+                + " --pretty",
+                "",
+                "External/manual alternative:",
+                "1. Materialize the raw artifacts and canonical fetch_execution.json with an external runner.",
+                "2. Import that fetch execution result:",
+                "python3 "
+                + str(SCRIPT_DIR / "eco_council_supervisor.py")
+                + " import-fetch-execution --run-dir "
                 + str(run_dir)
                 + " --pretty",
             ]
@@ -1756,6 +1781,168 @@ def ensure_decision_matches(payload: Any, *, round_id: str) -> None:
         raise ValueError(f"Decision round_id mismatch: expected {round_id}, got {payload_round_id}")
 
 
+def fetch_status_has_usable_artifact(status: dict[str, Any]) -> bool:
+    state = maybe_text(status.get("status"))
+    if state == "completed":
+        return True
+    return state == "skipped" and maybe_text(status.get("reason")) == "artifact_exists"
+
+
+def fetch_plan_steps(run_dir: Path, round_id: str) -> list[dict[str, Any]]:
+    payload = read_json(fetch_plan_path(run_dir, round_id))
+    if not isinstance(payload, dict):
+        raise ValueError("Fetch plan must be a JSON object.")
+    steps = payload.get("steps")
+    if not isinstance(steps, list):
+        raise ValueError("Fetch plan must include a steps list.")
+    if not all(isinstance(step, dict) for step in steps):
+        raise ValueError("Fetch plan steps must be JSON objects.")
+    return [step for step in steps if isinstance(step, dict)]
+
+
+def resolved_required_path(value: Any, *, label: str) -> Path:
+    text = maybe_text(value)
+    if not text:
+        raise ValueError(f"{label} is missing.")
+    return Path(text).expanduser().resolve()
+
+
+def optional_resolved_path(value: Any) -> Path | None:
+    text = maybe_text(value)
+    if not text:
+        return None
+    return Path(text).expanduser().resolve()
+
+
+def ensure_fetch_execution_matches(payload: Any, *, run_dir: Path, round_id: str, source_path: Path) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("Fetch execution payload must be a JSON object.")
+    payload_round_id = maybe_text(payload.get("round_id"))
+    if not payload_round_id:
+        raise ValueError("Fetch execution payload must include round_id.")
+    if payload_round_id != round_id:
+        raise ValueError(f"Fetch execution round_id mismatch: expected {round_id}, got {payload_round_id}")
+    payload_run_dir = maybe_text(payload.get("run_dir"))
+    expected_run_dir = run_dir.expanduser().resolve()
+    if payload_run_dir:
+        found_run_dir = Path(payload_run_dir).expanduser().resolve()
+        if found_run_dir != expected_run_dir:
+            raise ValueError(f"Fetch execution run_dir mismatch: expected {expected_run_dir}, got {found_run_dir}")
+    payload_plan_path = maybe_text(payload.get("plan_path"))
+    expected_plan_path = fetch_plan_path(run_dir, round_id).expanduser().resolve()
+    if not payload_plan_path:
+        raise ValueError("Fetch execution payload must include plan_path.")
+    found_plan_path = Path(payload_plan_path).expanduser().resolve()
+    if found_plan_path != expected_plan_path:
+        raise ValueError(f"Fetch execution plan_path mismatch: expected {expected_plan_path}, got {found_plan_path}")
+    expected_plan_sha256 = file_sha256(expected_plan_path)
+    payload_plan_sha256 = maybe_text(payload.get("plan_sha256"))
+    if payload_plan_sha256:
+        if payload_plan_sha256 != expected_plan_sha256:
+            raise ValueError("Fetch execution plan_sha256 does not match the current fetch_plan.json.")
+    elif source_path.exists() and source_path.stat().st_mtime_ns < expected_plan_path.stat().st_mtime_ns:
+        raise ValueError("Fetch execution appears older than the current fetch_plan.json. Regenerate it from the current round inputs.")
+    expected_steps = fetch_plan_steps(run_dir, round_id)
+    expected_by_step: dict[str, dict[str, Any]] = {}
+    for step in expected_steps:
+        step_id = maybe_text(step.get("step_id"))
+        if not step_id:
+            raise ValueError("Fetch plan contains a step without step_id.")
+        if step_id in expected_by_step:
+            raise ValueError(f"Fetch plan contains duplicate step_id: {step_id}")
+        expected_by_step[step_id] = step
+    statuses = payload.get("statuses")
+    if not isinstance(statuses, list):
+        raise ValueError("Fetch execution payload must include a statuses list.")
+    expected_step_count = len(expected_steps)
+    payload_step_count = maybe_int(payload.get("step_count"))
+    if payload_step_count != expected_step_count:
+        raise ValueError(f"Fetch execution step_count mismatch: expected {expected_step_count}, got {payload_step_count}")
+    if len(statuses) != expected_step_count:
+        raise ValueError(f"Fetch execution statuses length mismatch: expected {expected_step_count}, got {len(statuses)}")
+    failed = [item for item in statuses if isinstance(item, dict) and maybe_text(item.get("status")) == "failed"]
+    if failed:
+        raise ValueError(f"Fetch execution still contains failed steps: {failed}")
+    actual_completed = sum(1 for item in statuses if isinstance(item, dict) and maybe_text(item.get("status")) == "completed")
+    actual_failed = sum(1 for item in statuses if isinstance(item, dict) and maybe_text(item.get("status")) == "failed")
+    if maybe_int(payload.get("completed_count")) != actual_completed:
+        raise ValueError(
+            f"Fetch execution completed_count mismatch: expected {actual_completed}, got {maybe_int(payload.get('completed_count'))}"
+        )
+    if maybe_int(payload.get("failed_count")) != actual_failed:
+        raise ValueError(
+            f"Fetch execution failed_count mismatch: expected {actual_failed}, got {maybe_int(payload.get('failed_count'))}"
+        )
+    seen_step_ids: set[str] = set()
+    for status in statuses:
+        if not isinstance(status, dict):
+            raise ValueError("Fetch execution statuses must be JSON objects.")
+        step_id = maybe_text(status.get("step_id"))
+        if not step_id:
+            raise ValueError(f"Fetch execution status is missing step_id: {status}")
+        if step_id in seen_step_ids:
+            raise ValueError(f"Fetch execution contains duplicate status for step_id: {step_id}")
+        seen_step_ids.add(step_id)
+        expected_step = expected_by_step.get(step_id)
+        if expected_step is None:
+            raise ValueError(f"Fetch execution contains unexpected step_id: {step_id}")
+        expected_role = maybe_text(expected_step.get("role"))
+        if maybe_text(status.get("role")) != expected_role:
+            raise ValueError(f"Fetch execution role mismatch for {step_id}: expected {expected_role}, got {maybe_text(status.get('role'))}")
+        expected_source_skill = maybe_text(expected_step.get("source_skill"))
+        if maybe_text(status.get("source_skill")) != expected_source_skill:
+            raise ValueError(
+                f"Fetch execution source_skill mismatch for {step_id}: "
+                f"expected {expected_source_skill}, got {maybe_text(status.get('source_skill'))}"
+            )
+        if not fetch_status_has_usable_artifact(status):
+            raise ValueError(f"Fetch execution step {step_id} is not usable for downstream data-plane import: {status}")
+        artifact_path = resolved_required_path(status.get("artifact_path"), label=f"fetch execution {step_id} artifact_path")
+        expected_artifact_path = resolved_required_path(expected_step.get("artifact_path"), label=f"fetch plan {step_id} artifact_path")
+        if artifact_path != expected_artifact_path:
+            raise ValueError(
+                f"Fetch execution artifact_path mismatch for {step_id}: expected {expected_artifact_path}, got {artifact_path}"
+            )
+        if not artifact_path.exists():
+            raise ValueError(f"Fetch execution artifact_path does not exist: {artifact_path}")
+        status_state = maybe_text(status.get("status"))
+        expected_stdout_path = resolved_required_path(expected_step.get("stdout_path"), label=f"fetch plan {step_id} stdout_path")
+        expected_stderr_path = resolved_required_path(expected_step.get("stderr_path"), label=f"fetch plan {step_id} stderr_path")
+        actual_stdout_path = optional_resolved_path(status.get("stdout_path"))
+        actual_stderr_path = optional_resolved_path(status.get("stderr_path"))
+        if status_state == "completed":
+            if actual_stdout_path is None or actual_stderr_path is None:
+                raise ValueError(f"Fetch execution completed step {step_id} must include stdout_path and stderr_path.")
+            if actual_stdout_path != expected_stdout_path:
+                raise ValueError(
+                    f"Fetch execution stdout_path mismatch for {step_id}: expected {expected_stdout_path}, got {actual_stdout_path}"
+                )
+            if actual_stderr_path != expected_stderr_path:
+                raise ValueError(
+                    f"Fetch execution stderr_path mismatch for {step_id}: expected {expected_stderr_path}, got {actual_stderr_path}"
+                )
+            if not actual_stdout_path.exists():
+                raise ValueError(f"Fetch execution stdout_path does not exist: {actual_stdout_path}")
+            if not actual_stderr_path.exists():
+                raise ValueError(f"Fetch execution stderr_path does not exist: {actual_stderr_path}")
+        else:
+            if actual_stdout_path is not None and actual_stdout_path != expected_stdout_path:
+                raise ValueError(
+                    f"Fetch execution stdout_path mismatch for skipped step {step_id}: expected {expected_stdout_path}, got {actual_stdout_path}"
+                )
+            if actual_stderr_path is not None and actual_stderr_path != expected_stderr_path:
+                raise ValueError(
+                    f"Fetch execution stderr_path mismatch for skipped step {step_id}: expected {expected_stderr_path}, got {actual_stderr_path}"
+                )
+            if actual_stdout_path is not None and not actual_stdout_path.exists():
+                raise ValueError(f"Fetch execution stdout_path does not exist: {actual_stdout_path}")
+            if actual_stderr_path is not None and not actual_stderr_path.exists():
+                raise ValueError(f"Fetch execution stderr_path does not exist: {actual_stderr_path}")
+    missing_step_ids = sorted(set(expected_by_step) - seen_step_ids)
+    if missing_step_ids:
+        raise ValueError(f"Fetch execution is missing statuses for steps: {missing_step_ids}")
+
+
 def import_task_review_payload(*, run_dir: Path, state: dict[str, Any], payload: Any, source_path: Path) -> dict[str, Any]:
     round_id = maybe_text(state.get("current_round_id"))
     ensure_task_review_matches(payload, round_id=round_id)
@@ -1845,6 +2032,22 @@ def import_decision_payload(*, run_dir: Path, state: dict[str, Any], payload: An
     save_state(run_dir, state)
     return {
         "imported_kind": "council-decision",
+        "input_path": str(source_path),
+        "target_path": str(target),
+        "state": build_status_payload(run_dir, state),
+    }
+
+
+def import_fetch_execution_payload(*, run_dir: Path, state: dict[str, Any], payload: Any, source_path: Path) -> dict[str, Any]:
+    round_id = maybe_text(state.get("current_round_id"))
+    ensure_fetch_execution_matches(payload, run_dir=run_dir, round_id=round_id, source_path=source_path)
+    target = fetch_execution_path(run_dir, round_id)
+    write_json(target, payload, pretty=True)
+    state["fetch_execution"] = "external-import"
+    state["stage"] = STAGE_READY_DATA_PLANE
+    save_state(run_dir, state)
+    return {
+        "imported_kind": "fetch-execution",
         "input_path": str(source_path),
         "target_path": str(target),
         "state": build_status_payload(run_dir, state),
@@ -2352,6 +2555,25 @@ def command_import_decision(args: argparse.Namespace) -> dict[str, Any]:
         return import_decision_payload(run_dir=run_dir, state=state, payload=payload, source_path=input_path)
 
 
+def command_import_fetch_execution(args: argparse.Namespace) -> dict[str, Any]:
+    run_dir = Path(args.run_dir).expanduser().resolve()
+    with exclusive_file_lock(supervisor_state_lock_path(run_dir)):
+        state = load_state(run_dir)
+        if maybe_text(state.get("stage")) != STAGE_READY_FETCH:
+            raise ValueError("import-fetch-execution is only allowed while waiting for fetch execution.")
+        round_id = maybe_text(state.get("current_round_id"))
+        with exclusive_file_lock(fetch_lock_path(run_dir, round_id)):
+            input_path = (
+                Path(args.input).expanduser().resolve()
+                if args.input
+                else fetch_execution_path(run_dir, round_id).expanduser().resolve()
+            )
+            if not input_path.exists():
+                raise ValueError(f"Fetch execution input file does not exist: {input_path}")
+            payload = read_json(input_path)
+            return import_fetch_execution_payload(run_dir=run_dir, state=state, payload=payload, source_path=input_path)
+
+
 def command_run_agent_step(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = Path(args.run_dir).expanduser().resolve()
     state = load_state(run_dir)
@@ -2625,6 +2847,18 @@ def build_parser() -> argparse.ArgumentParser:
     import_decision.add_argument("--input", required=True, help="JSON file returned by the moderator.")
     import_decision.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
 
+    import_fetch_execution = sub.add_parser(
+        "import-fetch-execution",
+        help="Import canonical fetch_execution.json produced by an external fetch runner.",
+    )
+    import_fetch_execution.add_argument("--run-dir", required=True, help="Eco-council run directory.")
+    import_fetch_execution.add_argument(
+        "--input",
+        default="",
+        help="Optional fetch execution JSON path. Defaults to the canonical round fetch_execution.json path.",
+    )
+    import_fetch_execution.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
+
     return parser
 
 
@@ -2642,6 +2876,7 @@ def main(argv: list[str] | None = None) -> int:
         "import-source-selection": command_import_source_selection,
         "import-report": command_import_report,
         "import-decision": command_import_decision,
+        "import-fetch-execution": command_import_fetch_execution,
     }
     try:
         payload = handlers[args.command](args)

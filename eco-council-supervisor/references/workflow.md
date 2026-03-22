@@ -37,6 +37,9 @@ The supervisor keeps a strict split:
   - Run `continue-run`.
 - `ready-to-execute-fetch-plan`
   - Run `continue-run`.
+  - External/manual fallback: write the round `raw/` artifacts plus canonical `fetch_execution.json`, then use `import-fetch-execution`.
+  - The imported execution record must cover every current-plan step, match current step ids and artifact paths, and contain only usable statuses for downstream normalization.
+  - `import-fetch-execution` acquires the same round `fetch.lock` as live fetch execution so external runners and supervisor import stay serialized.
 - `ready-to-run-data-plane`
   - Run `continue-run`.
 - `awaiting-expert-reports`

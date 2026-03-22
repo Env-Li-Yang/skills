@@ -21,6 +21,7 @@ Use this skill when the eco-council flow should be driven by one deterministic l
   - `import-source-selection`
   - `import-report`
   - `import-decision`
+8. If raw fetch is produced by an external runner instead of `continue-run`, import the canonical `fetch_execution.json` with `import-fetch-execution`.
 
 ## Command Surface
 
@@ -58,6 +59,8 @@ Use this skill when the eco-council flow should be driven by one deterministic l
 - `python3 scripts/eco_council_supervisor.py import-source-selection ...`
 - `python3 scripts/eco_council_supervisor.py import-report ...`
 - `python3 scripts/eco_council_supervisor.py import-decision ...`
+- `python3 scripts/eco_council_supervisor.py import-fetch-execution --run-dir ... [--input ...] --pretty`
+  - Accepts canonical `fetch_execution.json` produced by an external raw-data runner, validates it against the full current fetch plan under the shared `fetch.lock`, and advances the stage to `ready-to-run-data-plane`.
 
 ## Guardrails
 
@@ -65,6 +68,7 @@ Use this skill when the eco-council flow should be driven by one deterministic l
 - Keep agents limited to JSON-only outputs.
 - No source runs unless an expert selected it in `source_selection.json` or a task explicitly forces it through `task.inputs.required_sources`.
 - Treat `RUN_DIR/supervisor/CURRENT_STEP.txt` as the human checklist.
+- If raw artifacts come from an external runner or simulator, import only a canonical `fetch_execution.json` whose usable artifact paths already exist.
 - If OpenClaw cannot load local repo skills directly, still use the generated prompt files as the source of truth.
 - Treat the case-library SQLite database as historical record storage, not as a replacement for canonical per-run JSON artifacts.
 - Treat moderator historical context as planning-only retrieval help; it must not override current-run evidence.

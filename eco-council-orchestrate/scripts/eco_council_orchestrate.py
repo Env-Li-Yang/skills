@@ -1718,6 +1718,7 @@ def execute_fetch_plan(
             "run_dir": str(run_path),
             "round_id": current_round_id,
             "plan_path": str(plan_path),
+            "plan_sha256": file_sha256(plan_path),
             "step_count": len(steps),
             "completed_count": sum(1 for status in statuses if status.get("status") == "completed"),
             "failed_count": sum(1 for status in statuses if status.get("status") == "failed"),
