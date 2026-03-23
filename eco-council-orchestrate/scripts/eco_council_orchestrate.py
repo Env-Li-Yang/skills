@@ -34,6 +34,8 @@ SKILL_DIRS = {
     "youtube-comments-fetch": REPO_DIR / "youtube-comments-fetch",
     "regulationsgov-comments-fetch": REPO_DIR / "regulationsgov-comments-fetch",
     "regulationsgov-comment-detail-fetch": REPO_DIR / "regulationsgov-comment-detail-fetch",
+    "airnow-hourly-obs-fetch": REPO_DIR / "airnow-hourly-obs-fetch",
+    "usgs-water-iv-fetch": REPO_DIR / "usgs-water-iv-fetch",
     "open-meteo-air-quality-fetch": REPO_DIR / "open-meteo-air-quality-fetch",
     "open-meteo-historical-fetch": REPO_DIR / "open-meteo-historical-fetch",
     "open-meteo-flood-fetch": REPO_DIR / "open-meteo-flood-fetch",
@@ -48,6 +50,8 @@ FETCH_SCRIPT_PATHS = {
     "youtube-comments-fetch": SKILL_DIRS["youtube-comments-fetch"] / "scripts" / "youtube_comments_fetch.py",
     "regulationsgov-comments-fetch": SKILL_DIRS["regulationsgov-comments-fetch"] / "scripts" / "regulationsgov_comments_fetch.py",
     "regulationsgov-comment-detail-fetch": SKILL_DIRS["regulationsgov-comment-detail-fetch"] / "scripts" / "regulationsgov_comment_detail_fetch.py",
+    "airnow-hourly-obs-fetch": SKILL_DIRS["airnow-hourly-obs-fetch"] / "scripts" / "airnow_hourly_obs_fetch.py",
+    "usgs-water-iv-fetch": SKILL_DIRS["usgs-water-iv-fetch"] / "scripts" / "usgs_water_iv_fetch.py",
     "open-meteo-air-quality-fetch": SKILL_DIRS["open-meteo-air-quality-fetch"] / "scripts" / "open_meteo_air_quality_fetch.py",
     "open-meteo-historical-fetch": SKILL_DIRS["open-meteo-historical-fetch"] / "scripts" / "open_meteo_historical_fetch.py",
     "open-meteo-flood-fetch": SKILL_DIRS["open-meteo-flood-fetch"] / "scripts" / "open_meteo_flood_fetch.py",
@@ -63,6 +67,8 @@ PUBLIC_SOURCES = (
     "regulationsgov-comment-detail-fetch",
 )
 ENVIRONMENT_SOURCES = (
+    "airnow-hourly-obs-fetch",
+    "usgs-water-iv-fetch",
     "open-meteo-air-quality-fetch",
     "open-meteo-historical-fetch",
     "open-meteo-flood-fetch",
@@ -84,6 +90,20 @@ DEFAULT_OPEN_METEO_AIR_VARS = [
     "ozone",
     "us_aqi",
 ]
+DEFAULT_AIRNOW_PARAMETER_NAMES = [
+    "PM25",
+    "PM10",
+    "OZONE",
+    "NO2",
+]
+DEFAULT_AIRNOW_POINT_PADDING_DEG = 0.25
+DEFAULT_USGS_PARAMETER_CODES = [
+    "00060",
+    "00065",
+]
+DEFAULT_USGS_POINT_PADDING_DEG = 0.25
+DEFAULT_USGS_SITE_TYPE = "ST"
+DEFAULT_USGS_SITE_STATUS = "active"
 DEFAULT_OPEN_METEO_HIST_HOURLY_VARS = [
     "temperature_2m",
     "relative_humidity_2m",
@@ -231,6 +251,29 @@ def to_date_text(value: str) -> str:
 
 def to_gdelt_datetime(value: str) -> str:
     return parse_utc_datetime(value).strftime("%Y%m%d%H%M%S")
+
+
+def firms_source_for_window(window: dict[str, Any], requested_source: str) -> str:
+    source = (requested_source or "VIIRS_NOAA20_NRT").strip()
+    if not source.endswith("_NRT"):
+        return source
+    end_text = maybe_text(window.get("end_utc"))
+    if not end_text:
+        return source
+    try:
+        end_dt = parse_utc_datetime(end_text)
+    except ValueError:
+        return source
+    age_days = (datetime.now(timezone.utc) - end_dt).days
+    if age_days <= 30:
+        return source
+    archival_source = source.removesuffix("_NRT") + "_SP"
+    known_archival = {
+        "MODIS_SP",
+        "VIIRS_NOAA20_SP",
+        "VIIRS_SNPP_SP",
+    }
+    return archival_source if archival_source in known_archival else source
 
 
 def round_dir_name(round_id: str) -> str:
@@ -1013,6 +1056,14 @@ def build_environmentalist_steps(
         geometry,
         point_padding_deg=float(merged_task_scalar(role_tasks, "firms_point_padding_deg") or firms_point_padding_deg),
     )
+    airnow_bbox_text = bbox_text_for_geometry(
+        geometry,
+        point_padding_deg=float(merged_task_scalar(role_tasks, "airnow_point_padding_deg") or DEFAULT_AIRNOW_POINT_PADDING_DEG),
+    )
+    usgs_bbox_text = bbox_text_for_geometry(
+        geometry,
+        point_padding_deg=float(merged_task_scalar(role_tasks, "usgs_point_padding_deg") or DEFAULT_USGS_POINT_PADDING_DEG),
+    )
 
     steps: list[dict[str, Any]] = []
     counter = 0
@@ -1028,7 +1079,59 @@ def build_environmentalist_steps(
         skill_refs = [f"${source_skill}"]
         env_file = default_env_file(source_skill)
 
-        if source_skill == "open-meteo-air-quality-fetch":
+        if source_skill == "airnow-hourly-obs-fetch":
+            argv = [
+                "python3",
+                str(FETCH_SCRIPT_PATHS[source_skill]),
+                "fetch",
+                f"--bbox={airnow_bbox_text}",
+                "--start-datetime",
+                window["start_utc"],
+                "--end-datetime",
+                window["end_utc"],
+            ]
+            for parameter_name in merged_task_string_list(role_tasks, "airnow_parameter_names") or DEFAULT_AIRNOW_PARAMETER_NAMES:
+                argv.extend(["--parameter", parameter_name])
+            argv.extend(
+                [
+                    "--output",
+                    str(artifact_path),
+                    "--pretty",
+                ]
+            )
+            notes.append(
+                "Collect AirNow hourly monitoring-site observations from official file products for the mission bbox and UTC window."
+            )
+            command = shell_command(argv, env_file=env_file)
+        elif source_skill == "usgs-water-iv-fetch":
+            argv = [
+                "python3",
+                str(FETCH_SCRIPT_PATHS[source_skill]),
+                "fetch",
+                f"--bbox={usgs_bbox_text}",
+                "--start-datetime",
+                window["start_utc"],
+                "--end-datetime",
+                window["end_utc"],
+                "--site-type",
+                merged_task_scalar(role_tasks, "usgs_site_type") or DEFAULT_USGS_SITE_TYPE,
+                "--site-status",
+                merged_task_scalar(role_tasks, "usgs_site_status") or DEFAULT_USGS_SITE_STATUS,
+            ]
+            for parameter_code in merged_task_string_list(role_tasks, "usgs_parameter_codes") or DEFAULT_USGS_PARAMETER_CODES:
+                argv.extend(["--parameter-code", parameter_code])
+            argv.extend(
+                [
+                    "--output",
+                    str(artifact_path),
+                    "--pretty",
+                ]
+            )
+            notes.append(
+                "Collect USGS station-based hydrology observations for the mission bbox and UTC window."
+            )
+            command = shell_command(argv, env_file=env_file)
+        elif source_skill == "open-meteo-air-quality-fetch":
             argv = [
                 "python3",
                 str(FETCH_SCRIPT_PATHS[source_skill]),
@@ -1124,14 +1227,17 @@ def build_environmentalist_steps(
             notes.append("Collect hydrology and flood-background discharge signals for the mission geometry.")
             command = shell_command(argv, env_file=env_file)
         elif source_skill == "nasa-firms-fire-fetch":
+            selected_firms_source = firms_source_for_window(
+                window,
+                merged_task_scalar(role_tasks, "firms_source") or "VIIRS_NOAA20_NRT",
+            )
             argv = [
                 "python3",
                 str(FETCH_SCRIPT_PATHS[source_skill]),
                 "fetch",
                 "--source",
-                merged_task_scalar(role_tasks, "firms_source") or "VIIRS_NOAA20_NRT",
-                "--bbox",
-                bbox_text,
+                selected_firms_source,
+                f"--bbox={bbox_text}",
                 "--start-date",
                 to_date_text(window["start_utc"]),
                 "--end-date",
