@@ -78,6 +78,7 @@ MATCHING_ADJUDICATION_STEP_IDS = (
     "validate-bundle",
     "build-reporting-handoff",
 )
+MAX_OPENCLAW_INLINE_MESSAGE_CHARS = 100000
 
 
 def load_contract_module() -> Any | None:
@@ -694,11 +695,12 @@ def extract_json_suffix(text: str) -> Any:
     raise ValueError(f"Command output did not contain parseable JSON:\n{clean}")
 
 
-def run_json_command(argv: list[str], *, cwd: Path | None = None) -> Any:
+def run_json_command(argv: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> Any:
     completed = subprocess.run(
         argv,
         cwd=str(cwd) if cwd is not None else None,
         capture_output=True,
+        env=env,
         text=True,
         check=False,
     )
@@ -714,11 +716,12 @@ def run_json_command(argv: list[str], *, cwd: Path | None = None) -> Any:
     return extract_json_suffix(completed.stdout)
 
 
-def run_check_command(argv: list[str], *, cwd: Path | None = None) -> None:
+def run_check_command(argv: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     completed = subprocess.run(
         argv,
         cwd=str(cwd) if cwd is not None else None,
         capture_output=True,
+        env=env,
         text=True,
         check=False,
     )
@@ -731,6 +734,29 @@ def run_check_command(argv: list[str], *, cwd: Path | None = None) -> None:
             + "\nSTDERR:\n"
             + completed.stderr
         )
+
+
+def cloned_json(value: Any) -> Any:
+    return json.loads(json.dumps(value))
+
+
+def openclaw_runtime_root(run_dir: Path) -> Path:
+    return supervisor_dir(run_dir) / "openclaw-runtime"
+
+
+def openclaw_cli_env(run_dir: Path) -> dict[str, str]:
+    runtime_root = openclaw_runtime_root(run_dir)
+    state_dir = runtime_root / "state"
+    cache_dir = runtime_root / "cache"
+    config_path = runtime_root / "openclaw.json"
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["OPENCLAW_STATE_DIR"] = str(state_dir)
+    env["OPENCLAW_CONFIG_PATH"] = str(config_path)
+    env["XDG_CACHE_HOME"] = str(cache_dir)
+    return env
 
 
 def load_state(run_dir: Path) -> dict[str, Any]:
@@ -1176,6 +1202,30 @@ def role_prompt_outbox_text(*, role: str, round_id: str, prompt_path: Path, hist
     return "\n".join(lines)
 
 
+def maybe_compact_openclaw_message(
+    *,
+    inline_message: str,
+    session_text: str,
+    role: str,
+    round_id: str,
+    prompt_path: Path,
+    history_path: Path | None = None,
+) -> str:
+    if len(inline_message) <= MAX_OPENCLAW_INLINE_MESSAGE_CHARS:
+        return inline_message
+    return "\n\n".join(
+        [
+            session_text,
+            role_prompt_outbox_text(
+                role=role,
+                round_id=round_id,
+                prompt_path=prompt_path,
+                history_path=history_path,
+            ),
+        ]
+    )
+
+
 def build_source_selection_packet(run_dir: Path, round_id: str, role: str) -> Path:
     mission_payload = read_json(mission_path(run_dir))
     if not isinstance(mission_payload, dict):
@@ -1236,6 +1286,7 @@ def render_source_selection_prompt(run_dir: Path, round_id: str, role: str) -> P
         "7. Fill family_plans explicitly. Include one family_plans entry for every governed family in packet.governance.families and one layer_plans entry for every governed layer.",
         "7a. Each family_plans entry must include selected and reason. Use the exact key name reason, not justification.",
         "7b. Each layer_plans entry must include selected and reason. Use the exact key name reason, not justification.",
+        "7c. Put layer_plans inside each family_plans item. Do not return a top-level layer_plans field.",
         "8. Every layer_plans entry must include anchor_mode and anchor_refs. Use anchor_mode=none and anchor_refs=[] for L1 layers and any unanchored or unselected layer.",
         "9. For each selected L2 layer, provide a non-empty anchor_refs list and a non-none anchor_mode.",
         "10. Use authorization_basis=entry-layer for L1 entry layers, policy-auto for auto-selectable non-entry layers, and upstream-approval for packet.governance.approved_layers decisions.",
@@ -2984,7 +3035,7 @@ def normalize_source_selection_payload(payload: Any) -> Any:
     if not isinstance(payload, dict):
         return payload
 
-    normalized = json.loads(json.dumps(payload))
+    normalized = cloned_json(payload)
     status = maybe_text(normalized.get("status")).casefold()
     status_aliases = {
         "completed": "complete",
@@ -3012,6 +3063,17 @@ def normalize_source_selection_payload(payload: Any) -> Any:
             fixed_decisions.append(decision)
         normalized["source_decisions"] = fixed_decisions
 
+    top_level_layers = normalized.get("layer_plans")
+    grouped_top_level_layers: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(top_level_layers, list):
+        for layer in top_level_layers:
+            if not isinstance(layer, dict):
+                continue
+            family_id = maybe_text(layer.get("family_id"))
+            if not family_id:
+                continue
+            grouped_top_level_layers.setdefault(family_id, []).append(dict(layer))
+
     family_plans = normalized.get("family_plans")
     if isinstance(family_plans, list):
         fixed_families: list[Any] = []
@@ -3024,7 +3086,21 @@ def normalize_source_selection_payload(payload: Any) -> Any:
                 family_plan["reason"] = family_plan.pop("justification")
             family_id = maybe_text(family_plan.get("family_id"))
             layer_plans = family_plan.get("layer_plans")
+            if (not isinstance(layer_plans, list) or not layer_plans) and family_id in grouped_top_level_layers:
+                layer_plans = grouped_top_level_layers.get(family_id, [])
+                family_plan["layer_plans"] = layer_plans
             if isinstance(layer_plans, list):
+                existing_keys = {
+                    (family_id, maybe_text(layer.get("layer_id")))
+                    for layer in layer_plans
+                    if isinstance(layer, dict) and maybe_text(layer.get("layer_id"))
+                }
+                for lifted_layer in grouped_top_level_layers.get(family_id, []):
+                    layer_key = (family_id, maybe_text(lifted_layer.get("layer_id")))
+                    if not layer_key[1] or layer_key in existing_keys:
+                        continue
+                    layer_plans.append(dict(lifted_layer))
+                    existing_keys.add(layer_key)
                 fixed_layers: list[Any] = []
                 for layer in layer_plans:
                     if not isinstance(layer, dict):
@@ -3072,6 +3148,60 @@ def normalize_source_selection_payload(payload: Any) -> Any:
                     )
             fixed_families.append(family_plan)
         normalized["family_plans"] = fixed_families
+    if "layer_plans" in normalized:
+        normalized.pop("layer_plans", None)
+
+    return normalized
+
+
+def synthesize_claim_meaning(record: dict[str, Any]) -> str:
+    summary = maybe_text(record.get("summary"))
+    statement = maybe_text(record.get("statement"))
+    claim_type = maybe_text(record.get("claim_type")) or "public"
+    if summary:
+        return f"Preserves this {claim_type} claim as auditable evidence for later cross-domain matching: {summary}"
+    if statement:
+        return f"Preserves this {claim_type} claim as auditable evidence for later cross-domain matching: {statement}"
+    return f"Preserves this {claim_type} claim as auditable evidence for later cross-domain matching."
+
+
+def normalize_claim_curation_payload(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+
+    normalized = cloned_json(payload)
+    status = maybe_text(normalized.get("status")).casefold()
+    status_aliases = {
+        "completed": "complete",
+        "complete": "complete",
+        "done": "complete",
+        "finished": "complete",
+        "in_progress": "pending",
+        "in-progress": "pending",
+        "pending": "pending",
+        "blocked": "blocked",
+    }
+    if status in status_aliases:
+        normalized["status"] = status_aliases[status]
+
+    curated_claims = normalized.get("curated_claims")
+    if isinstance(curated_claims, list):
+        fixed_claims: list[Any] = []
+        for index, claim in enumerate(curated_claims, start=1):
+            if not isinstance(claim, dict):
+                fixed_claims.append(claim)
+                continue
+            fixed_claim = dict(claim)
+            if not maybe_text(fixed_claim.get("meaning")):
+                fixed_claim["meaning"] = synthesize_claim_meaning(fixed_claim)
+            priority = fixed_claim.get("priority")
+            if isinstance(priority, str) and maybe_text(priority).isdigit():
+                priority = int(maybe_text(priority))
+            if not isinstance(priority, int):
+                priority = index
+            fixed_claim["priority"] = max(1, min(5, priority))
+            fixed_claims.append(fixed_claim)
+        normalized["curated_claims"] = fixed_claims
 
     return normalized
 
@@ -3080,7 +3210,7 @@ def normalize_matching_authorization_payload(payload: Any) -> Any:
     if not isinstance(payload, dict):
         return payload
 
-    normalized = json.loads(json.dumps(payload))
+    normalized = cloned_json(payload)
 
     status_aliases = {
         "approved": "authorized",
@@ -3133,6 +3263,78 @@ def normalize_matching_authorization_payload(payload: Any) -> Any:
                 normalized[field_name] = False
 
     return normalized
+
+
+def infer_matching_result_status(result: dict[str, Any]) -> str:
+    matched_pairs = result.get("matched_pairs")
+    matched_claim_ids = result.get("matched_claim_ids")
+    matched_observation_ids = result.get("matched_observation_ids")
+    unmatched_claim_ids = result.get("unmatched_claim_ids")
+    unmatched_observation_ids = result.get("unmatched_observation_ids")
+
+    has_matches = any(
+        isinstance(values, list) and bool(values)
+        for values in (matched_pairs, matched_claim_ids, matched_observation_ids)
+    )
+    has_unmatched = any(
+        isinstance(values, list) and bool(values)
+        for values in (unmatched_claim_ids, unmatched_observation_ids)
+    )
+    if has_matches and not has_unmatched:
+        return "matched"
+    if has_matches and has_unmatched:
+        return "partial"
+    return "unmatched"
+
+
+def normalize_matching_adjudication_payload(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+
+    normalized = cloned_json(payload)
+    matching_result = normalized.get("matching_result")
+    if isinstance(matching_result, dict):
+        fixed_result = dict(matching_result)
+        status = maybe_text(fixed_result.get("result_status")).casefold()
+        alias_map = {
+            "matched": "matched",
+            "match": "matched",
+            "complete": infer_matching_result_status(fixed_result),
+            "completed": infer_matching_result_status(fixed_result),
+            "done": infer_matching_result_status(fixed_result),
+            "finished": infer_matching_result_status(fixed_result),
+            "partial": "partial",
+            "partially-matched": "partial",
+            "partially_matched": "partial",
+            "unmatched": "unmatched",
+            "none": "unmatched",
+        }
+        if status in alias_map:
+            fixed_result["result_status"] = alias_map[status]
+        elif not status:
+            fixed_result["result_status"] = infer_matching_result_status(fixed_result)
+        normalized["matching_result"] = fixed_result
+    return normalized
+
+
+def normalize_agent_payload_for_schema(
+    *,
+    schema_kind: str,
+    payload: Any,
+    run_dir: Path,
+    round_id: str,
+    role: str,
+) -> Any:
+    if schema_kind == "source-selection":
+        normalized = normalize_source_selection_payload(payload)
+        return hydrate_source_selection_layer_skills(run_dir=run_dir, round_id=round_id, role=role, payload=normalized)
+    if schema_kind == "claim-curation":
+        return normalize_claim_curation_payload(payload)
+    if schema_kind == "matching-authorization":
+        return normalize_matching_authorization_payload(payload)
+    if schema_kind == "matching-adjudication":
+        return normalize_matching_adjudication_payload(payload)
+    return payload
 
 
 def hydrate_source_selection_layer_skills(*, run_dir: Path, round_id: str, role: str, payload: Any) -> Any:
@@ -3554,9 +3756,6 @@ def ensure_fetch_execution_matches(payload: Any, *, run_dir: Path, round_id: str
         raise ValueError(f"Fetch execution step_count mismatch: expected {expected_step_count}, got {payload_step_count}")
     if len(statuses) != expected_step_count:
         raise ValueError(f"Fetch execution statuses length mismatch: expected {expected_step_count}, got {len(statuses)}")
-    failed = [item for item in statuses if isinstance(item, dict) and maybe_text(item.get("status")) == "failed"]
-    if failed:
-        raise ValueError(f"Fetch execution still contains failed steps: {failed}")
     actual_completed = sum(1 for item in statuses if isinstance(item, dict) and maybe_text(item.get("status")) == "completed")
     actual_failed = sum(1 for item in statuses if isinstance(item, dict) and maybe_text(item.get("status")) == "failed")
     if maybe_int(payload.get("completed_count")) != actual_completed:
@@ -4423,86 +4622,123 @@ def build_agent_message(*, run_dir: Path, state: dict[str, Any], role: str, turn
         ]
         if history_text:
             sections.append("=== HISTORICAL CASE CONTEXT ===\n" + history_text)
-        return "\n\n".join(sections)
+        return maybe_compact_openclaw_message(
+            inline_message="\n\n".join(sections),
+            session_text=session_text,
+            role=role,
+            round_id=round_id,
+            prompt_path=task_review_prompt_path(run_dir, round_id),
+            history_path=path if history_text else None,
+        )
 
     if turn_kind == "source-selection":
         prompt_text = load_text(source_selection_prompt_path(run_dir, round_id, role))
         packet_text = load_text(source_selection_packet_path(run_dir, round_id, role))
-        return "\n\n".join(
-            [
-                session_text,
-                (
-                    f"Current automated turn: {role} source selection for {round_id}.\n"
-                    "The required packet content is embedded below. Do not ask for filesystem access. "
-                    "Return only the final JSON object."
-                ),
-                "=== SOURCE SELECTION PROMPT ===\n" + prompt_text,
-                "=== SOURCE SELECTION PACKET.JSON ===\n" + packet_text,
-            ]
+        return maybe_compact_openclaw_message(
+            inline_message="\n\n".join(
+                [
+                    session_text,
+                    (
+                        f"Current automated turn: {role} source selection for {round_id}.\n"
+                        "The required packet content is embedded below. Do not ask for filesystem access. "
+                        "Return only the final JSON object."
+                    ),
+                    "=== SOURCE SELECTION PROMPT ===\n" + prompt_text,
+                    "=== SOURCE SELECTION PACKET.JSON ===\n" + packet_text,
+                ]
+            ),
+            session_text=session_text,
+            role=role,
+            round_id=round_id,
+            prompt_path=source_selection_prompt_path(run_dir, round_id, role),
         )
 
     if turn_kind == "claim-curation":
         prompt_text = load_text(claim_curation_prompt_path(run_dir, round_id))
         packet_text = load_text(claim_curation_packet_path(run_dir, round_id))
-        return "\n\n".join(
-            [
-                session_text,
-                (
-                    f"Current automated turn: sociologist claim curation for {round_id}.\n"
-                    "The required packet content is embedded below. Do not ask for filesystem access. "
-                    "Return only the final JSON object."
-                ),
-                "=== CLAIM CURATION PROMPT ===\n" + prompt_text,
-                "=== CLAIM CURATION PACKET.JSON ===\n" + packet_text,
-            ]
+        return maybe_compact_openclaw_message(
+            inline_message="\n\n".join(
+                [
+                    session_text,
+                    (
+                        f"Current automated turn: sociologist claim curation for {round_id}.\n"
+                        "The required packet content is embedded below. Do not ask for filesystem access. "
+                        "Return only the final JSON object."
+                    ),
+                    "=== CLAIM CURATION PROMPT ===\n" + prompt_text,
+                    "=== CLAIM CURATION PACKET.JSON ===\n" + packet_text,
+                ]
+            ),
+            session_text=session_text,
+            role=role,
+            round_id=round_id,
+            prompt_path=claim_curation_prompt_path(run_dir, round_id),
         )
 
     if turn_kind == "observation-curation":
         prompt_text = load_text(observation_curation_prompt_path(run_dir, round_id))
         packet_text = load_text(observation_curation_packet_path(run_dir, round_id))
-        return "\n\n".join(
-            [
-                session_text,
-                (
-                    f"Current automated turn: environmentalist observation curation for {round_id}.\n"
-                    "The required packet content is embedded below. Do not ask for filesystem access. "
-                    "Return only the final JSON object."
-                ),
-                "=== OBSERVATION CURATION PROMPT ===\n" + prompt_text,
-                "=== OBSERVATION CURATION PACKET.JSON ===\n" + packet_text,
-            ]
+        return maybe_compact_openclaw_message(
+            inline_message="\n\n".join(
+                [
+                    session_text,
+                    (
+                        f"Current automated turn: environmentalist observation curation for {round_id}.\n"
+                        "The required packet content is embedded below. Do not ask for filesystem access. "
+                        "Return only the final JSON object."
+                    ),
+                    "=== OBSERVATION CURATION PROMPT ===\n" + prompt_text,
+                    "=== OBSERVATION CURATION PACKET.JSON ===\n" + packet_text,
+                ]
+            ),
+            session_text=session_text,
+            role=role,
+            round_id=round_id,
+            prompt_path=observation_curation_prompt_path(run_dir, round_id),
         )
 
     if turn_kind == "data-readiness":
         prompt_text = load_text(data_readiness_prompt_path(run_dir, round_id, role))
         packet_text = load_text(data_readiness_packet_path(run_dir, round_id, role))
-        return "\n\n".join(
-            [
-                session_text,
-                (
-                    f"Current automated turn: {role} data-readiness auditing for {round_id}.\n"
-                    "The required packet content is embedded below. Do not ask for filesystem access. "
-                    "Return only the final JSON object."
-                ),
-                "=== DATA READINESS PROMPT ===\n" + prompt_text,
-                "=== DATA READINESS PACKET.JSON ===\n" + packet_text,
-            ]
+        return maybe_compact_openclaw_message(
+            inline_message="\n\n".join(
+                [
+                    session_text,
+                    (
+                        f"Current automated turn: {role} data-readiness auditing for {round_id}.\n"
+                        "The required packet content is embedded below. Do not ask for filesystem access. "
+                        "Return only the final JSON object."
+                    ),
+                    "=== DATA READINESS PROMPT ===\n" + prompt_text,
+                    "=== DATA READINESS PACKET.JSON ===\n" + packet_text,
+                ]
+            ),
+            session_text=session_text,
+            role=role,
+            round_id=round_id,
+            prompt_path=data_readiness_prompt_path(run_dir, round_id, role),
         )
 
     if turn_kind == "report":
         prompt_text = load_text(report_prompt_path(run_dir, round_id, role))
         packet_text = load_text(report_packet_path(run_dir, round_id, role))
-        return "\n\n".join(
-            [
-                session_text,
-                (
-                    f"Current automated turn: {role} report drafting for {round_id}.\n"
-                    "The required packet content is embedded below. Do not ask for filesystem access. "
-                    "Return only the final JSON object."
-                ),
-                "=== REPORT PROMPT ===\n" + prompt_text,
-                "=== REPORT PACKET.JSON ===\n" + packet_text,
-            ]
+        return maybe_compact_openclaw_message(
+            inline_message="\n\n".join(
+                [
+                    session_text,
+                    (
+                        f"Current automated turn: {role} report drafting for {round_id}.\n"
+                        "The required packet content is embedded below. Do not ask for filesystem access. "
+                        "Return only the final JSON object."
+                    ),
+                    "=== REPORT PROMPT ===\n" + prompt_text,
+                    "=== REPORT PACKET.JSON ===\n" + packet_text,
+                ]
+            ),
+            session_text=session_text,
+            role=role,
+            round_id=round_id,
+            prompt_path=report_prompt_path(run_dir, round_id, role),
         )
 
     if turn_kind == "matching-authorization":
@@ -4520,7 +4756,14 @@ def build_agent_message(*, run_dir: Path, state: dict[str, Any], role: str, turn
         ]
         if history_text:
             sections.append("=== HISTORICAL CASE CONTEXT ===\n" + history_text)
-        return "\n\n".join(sections)
+        return maybe_compact_openclaw_message(
+            inline_message="\n\n".join(sections),
+            session_text=session_text,
+            role=role,
+            round_id=round_id,
+            prompt_path=matching_authorization_prompt_path(run_dir, round_id),
+            history_path=path if history_text else None,
+        )
 
     if turn_kind == "matching-adjudication":
         prompt_text = load_text(matching_adjudication_prompt_path(run_dir, round_id))
@@ -4537,7 +4780,14 @@ def build_agent_message(*, run_dir: Path, state: dict[str, Any], role: str, turn
         ]
         if history_text:
             sections.append("=== HISTORICAL CASE CONTEXT ===\n" + history_text)
-        return "\n\n".join(sections)
+        return maybe_compact_openclaw_message(
+            inline_message="\n\n".join(sections),
+            session_text=session_text,
+            role=role,
+            round_id=round_id,
+            prompt_path=matching_adjudication_prompt_path(run_dir, round_id),
+            history_path=path if history_text else None,
+        )
 
     if turn_kind == "decision":
         prompt_text = load_text(decision_prompt_path(run_dir, round_id))
@@ -4554,7 +4804,14 @@ def build_agent_message(*, run_dir: Path, state: dict[str, Any], role: str, turn
         ]
         if history_text:
             sections.append("=== HISTORICAL CASE CONTEXT ===\n" + history_text)
-        return "\n\n".join(sections)
+        return maybe_compact_openclaw_message(
+            inline_message="\n\n".join(sections),
+            session_text=session_text,
+            role=role,
+            round_id=round_id,
+            prompt_path=decision_prompt_path(run_dir, round_id),
+            history_path=path if history_text else None,
+        )
 
     raise ValueError(f"Unsupported agent turn kind: {turn_kind}")
 
@@ -4571,6 +4828,7 @@ def run_openclaw_agent_turn(
     thinking: str,
 ) -> dict[str, Any]:
     round_id = maybe_text(state.get("current_round_id"))
+    ensure_openclaw_agent(run_dir, role=role, state=state)
     agent_id = maybe_text(state.get("openclaw", {}).get("agents", {}).get(role, {}).get("id"))
     if not agent_id:
         raise ValueError(f"No configured OpenClaw agent id for role={role}")
@@ -4600,6 +4858,7 @@ def run_openclaw_agent_turn(
         argv,
         cwd=str(REPO_DIR),
         capture_output=True,
+        env=openclaw_cli_env(run_dir),
         text=True,
         check=False,
     )
@@ -4611,12 +4870,13 @@ def run_openclaw_agent_turn(
             f"See {stdout_path} and {stderr_path}."
         )
 
-    payload = extract_json_suffix(completed.stdout)
-    if schema_kind == "source-selection":
-        payload = normalize_source_selection_payload(payload)
-        payload = hydrate_source_selection_layer_skills(run_dir=run_dir, round_id=round_id, role=role, payload=payload)
-    elif schema_kind == "matching-authorization":
-        payload = normalize_matching_authorization_payload(payload)
+    payload = normalize_agent_payload_for_schema(
+        schema_kind=schema_kind,
+        payload=extract_json_suffix(completed.stdout),
+        run_dir=run_dir,
+        round_id=round_id,
+        role=role,
+    )
     write_json(json_path, payload, pretty=True)
     validate_input_file(schema_kind, json_path)
     return {
@@ -4797,16 +5057,31 @@ def continue_execute_fetch(run_dir: Path, state: dict[str, Any], timeout_seconds
         for item in execution_payload.get("statuses", [])
         if isinstance(item, dict) and maybe_text(item.get("status")) == "failed"
     ]
-    if failures:
-        failed_step_ids = [maybe_text(item.get("step_id")) for item in failures if maybe_text(item.get("step_id"))]
-        execution_text = maybe_text(execution_payload.get("execution_path")) or str(fetch_execution_path(run_dir, round_id))
-        raise RuntimeError(
-            f"Fetch plan reported {len(failures)} failed step(s) for {round_id}. "
-            f"Inspect {execution_text}. Failed steps: {', '.join(failed_step_ids) or 'unknown'}."
-        )
     state["stage"] = STAGE_READY_DATA_PLANE
     save_state(run_dir, state)
-    return {"action": "execute-fetch-plan", "payload": payload, "state": build_status_payload(run_dir, state)}
+    result = {
+        "action": "execute-fetch-plan",
+        "payload": payload,
+        "state": build_status_payload(run_dir, state),
+    }
+    if failures:
+        result["warnings"] = [
+            {
+                "kind": "fetch-partial-failure",
+                "round_id": round_id,
+                "failed_step_ids": [
+                    maybe_text(item.get("step_id"))
+                    for item in failures
+                    if maybe_text(item.get("step_id"))
+                ],
+                "failed_count": len(failures),
+                "message": (
+                    "Fetch plan completed with partial failures. "
+                    "Downstream normalization will use only the successfully materialized artifacts."
+                ),
+            }
+        ]
+    return result
 
 
 def continue_recover_or_execute_fetch(run_dir: Path, state: dict[str, Any], timeout_seconds: int) -> dict[str, Any]:
@@ -5127,26 +5402,44 @@ def command_import_source_selection(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = Path(args.run_dir).expanduser().resolve()
     input_path = Path(args.input).expanduser().resolve()
     role = args.role
-    payload = normalize_source_selection_payload(read_json(input_path))
-    if payload != read_json(input_path):
-        write_json(input_path, payload, pretty=True)
-    validate_input_file("source-selection", input_path)
     with exclusive_file_lock(supervisor_state_lock_path(run_dir)):
         state = load_state(run_dir)
         if maybe_text(state.get("stage")) != STAGE_AWAITING_SOURCE_SELECTION:
             raise ValueError("import-source-selection is only allowed while waiting for expert source selection.")
+        round_id = maybe_text(state.get("current_round_id"))
+        original_payload = read_json(input_path)
+        payload = normalize_agent_payload_for_schema(
+            schema_kind="source-selection",
+            payload=original_payload,
+            run_dir=run_dir,
+            round_id=round_id,
+            role=role,
+        )
+        if payload != original_payload:
+            write_json(input_path, payload, pretty=True)
+        validate_input_file("source-selection", input_path)
         return import_source_selection_payload(run_dir=run_dir, state=state, role=role, payload=payload, source_path=input_path)
 
 
 def command_import_claim_curation(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = Path(args.run_dir).expanduser().resolve()
     input_path = Path(args.input).expanduser().resolve()
-    validate_input_file("claim-curation", input_path)
-    payload = read_json(input_path)
     with exclusive_file_lock(supervisor_state_lock_path(run_dir)):
         state = load_state(run_dir)
         if maybe_text(state.get("stage")) != STAGE_AWAITING_EVIDENCE_CURATION:
             raise ValueError("import-claim-curation is only allowed while waiting for expert evidence curation.")
+        round_id = maybe_text(state.get("current_round_id"))
+        original_payload = read_json(input_path)
+        payload = normalize_agent_payload_for_schema(
+            schema_kind="claim-curation",
+            payload=original_payload,
+            run_dir=run_dir,
+            round_id=round_id,
+            role="sociologist",
+        )
+        if payload != original_payload:
+            write_json(input_path, payload, pretty=True)
+        validate_input_file("claim-curation", input_path)
         return import_claim_curation_payload(run_dir=run_dir, state=state, payload=payload, source_path=input_path)
 
 
@@ -5193,12 +5486,22 @@ def command_import_matching_authorization(args: argparse.Namespace) -> dict[str,
 def command_import_matching_adjudication(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = Path(args.run_dir).expanduser().resolve()
     input_path = Path(args.input).expanduser().resolve()
-    validate_input_file("matching-adjudication", input_path)
-    payload = read_json(input_path)
     with exclusive_file_lock(supervisor_state_lock_path(run_dir)):
         state = load_state(run_dir)
         if maybe_text(state.get("stage")) != STAGE_AWAITING_MATCHING_ADJUDICATION:
             raise ValueError("import-matching-adjudication is only allowed while waiting for moderator matching adjudication.")
+        round_id = maybe_text(state.get("current_round_id"))
+        original_payload = read_json(input_path)
+        payload = normalize_agent_payload_for_schema(
+            schema_kind="matching-adjudication",
+            payload=original_payload,
+            run_dir=run_dir,
+            round_id=round_id,
+            role="moderator",
+        )
+        if payload != original_payload:
+            write_json(input_path, payload, pretty=True)
+        validate_input_file("matching-adjudication", input_path)
         return import_matching_adjudication_payload(run_dir=run_dir, state=state, payload=payload, source_path=input_path)
 
 
@@ -5364,8 +5667,12 @@ def command_run_agent_step(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def existing_openclaw_agents() -> dict[str, dict[str, Any]]:
-    payload = run_json_command(["openclaw", "agents", "list", "--json"], cwd=REPO_DIR)
+def existing_openclaw_agents(run_dir: Path) -> dict[str, dict[str, Any]]:
+    payload = run_json_command(
+        ["openclaw", "agents", "list", "--json"],
+        cwd=REPO_DIR,
+        env=openclaw_cli_env(run_dir),
+    )
     if not isinstance(payload, list):
         raise ValueError("Unexpected openclaw agents list payload.")
     output: dict[str, dict[str, Any]] = {}
@@ -5425,7 +5732,8 @@ def ensure_openclaw_agent(run_dir: Path, *, role: str, state: dict[str, Any]) ->
     write_openclaw_workspace_files(run_dir=run_dir, state=state, role=role, agent_id=agent_id)
     workspace = agent_workspace_path(state, role)
 
-    current_agents = existing_openclaw_agents()
+    env = openclaw_cli_env(run_dir)
+    current_agents = existing_openclaw_agents(run_dir)
     if agent_id not in current_agents:
         run_json_command(
             [
@@ -5439,6 +5747,7 @@ def ensure_openclaw_agent(run_dir: Path, *, role: str, state: dict[str, Any]) ->
                 "--json",
             ],
             cwd=REPO_DIR,
+            env=env,
         )
     run_json_command(
         [
@@ -5453,6 +5762,7 @@ def ensure_openclaw_agent(run_dir: Path, *, role: str, state: dict[str, Any]) ->
             "--json",
         ],
         cwd=REPO_DIR,
+        env=env,
     )
     role_info["workspace"] = str(workspace)
     role_info["guide_path"] = str(agent_command_guide_path(state=state, role=role))
