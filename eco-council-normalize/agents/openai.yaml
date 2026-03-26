@@ -1,4 +1,0 @@
-interface:
-  display_name: "Eco Council Normalize"
-  short_description: "Normalize submissions and evidence-library views"
-  default_prompt: "Use $eco-council-normalize to convert eco-council raw fetch outputs into canonical submissions, evidence-library views, shared claims and observations, matching artifacts, and round context JSON."
